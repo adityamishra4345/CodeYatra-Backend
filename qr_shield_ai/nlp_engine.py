@@ -1,59 +1,95 @@
-import re
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import requests
+import json
+import os
 
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "api")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+FALLBACK_RESPONSE = {
+    "verdict": "SUSPICIOUS",
+    "threat_score": 50,
+    "triggered_keywords": [],
+    "nlp_label": "Fallback",
+    "nlp_confidence": 0.5,
+    "findings": ["AI unavailable. Proceed with caution."]
+}
 
 def analyze_text_payload(user_text: str) -> dict:
-    findings = []
-    triggered_keywords = []
-    threat_score = 0
+    prompt = f"""
+You are an elite cybersecurity AI specializing in detecting phishing, scams, and social engineering attacks.
 
-    regex_rules = {
-        "Urgency/Fear": r"(suspension|block|unauthorized|action required|urgent|immediately|restrict)",
-        "OTP Harvest": r"(otp|one-time password|verification code|secure login|authorization)",
-        "Financial Trap": r"(lottery|prize|reward|gift card|crypto|bonus|claim package)"
-    }
+Analyze the following text and detect ANY of these red flags:
+- Asking for OTP, password, PIN, CVV, card number, or any credentials
+- Urgency or pressure tactics ("act now", "immediately", "hurry")
+- Impersonation (pretending to be bank, government, friend)
+- Requests for money transfer or personal information
+- Suspicious links or offers that seem too good to be true
 
-    for category, pattern in regex_rules.items():
-        matches = re.findall(pattern, user_text.lower())
-        if matches:
-            triggered_keywords.extend(list(set(matches)))
-            findings.append(f"Triggered risk indicator: {category}")
-            threat_score += 25
+EXAMPLES:
+- "give your otp" -> PHISHING, score 95
+- "click here to claim your prize" -> PHISHING, score 90
+- "hello how are you" -> SAFE, score 0
+- "your account will be blocked, share your password" -> PHISHING, score 99
 
-    inputs = tokenizer(user_text, return_tensors="pt", truncation=True, max_length=512)
-    
-    with torch.no_grad():
-        outputs = model(**inputs)
-    
-    logits = outputs.logits
-    confidence = torch.softmax(logits, dim=1).max().item()
+Text to analyze: "{user_text}"
 
-    if len(triggered_keywords) > 0:
-        nlp_confidence = float(max(confidence, 0.85))
-        nlp_label = "phishing/scam"
-        threat_score += 30
-    else:
-        nlp_confidence = float(confidence)
-        nlp_label = "safe/neutral"
+Return ONLY a valid JSON object with exactly these three keys:
+- "verdict": strictly "SAFE", "SUSPICIOUS", or "PHISHING"
+- "threat_score": integer from 0 to 100
+- "findings": list of 1 or 2 strings explaining exactly what the threat is
 
-    threat_score = min(threat_score, 100)
-    
-    if threat_score >= 60:
-        verdict = "PHISHING"
-    elif threat_score >= 30:
-        verdict = "SUSPICIOUS"
-    else:
-        verdict = "SAFE"
+Be aggressive — when in doubt, mark as SUSPICIOUS or PHISHING.
+"""
 
-    return {
-        "verdict": verdict,
-        "threat_score": threat_score,
-        "triggered_keywords": triggered_keywords,
-        "nlp_label": nlp_label,
-        "nlp_confidence": round(nlp_confidence, 2),
-        "findings": findings if findings else ["No typical scam metrics flagged."]
-    }
+    try:
+        response = requests.post(
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.1
+            },
+            timeout=30
+        )
+
+        if response.status_code == 429:
+            print("🚨 Quota exceeded (429). Returning fallback.")
+            return FALLBACK_RESPONSE
+
+        if response.status_code == 401:
+            print("🚨 Invalid API key (401). Check your Groq key.")
+            return FALLBACK_RESPONSE
+
+        response.raise_for_status()
+
+        data = response.json()
+        raw_text = data['choices'][0]['message']['content']
+        result = json.loads(raw_text)
+
+        return {
+            "verdict": result.get("verdict", "SUSPICIOUS"),
+            "threat_score": result.get("threat_score", 50),
+            "triggered_keywords": [],
+            "nlp_label": "Analysis",
+            "nlp_confidence": 0.99,
+            "findings": result.get("findings", ["AI analysis complete."])
+        }
+
+    except requests.exceptions.Timeout:
+        print("🚨 Request timed out.")
+        return FALLBACK_RESPONSE
+
+    except requests.exceptions.ConnectionError:
+        print("🚨 Connection error. Check internet.")
+        return FALLBACK_RESPONSE
+
+    except Exception as e:
+        print(f"🚨 Unexpected error: {e}")
+        if 'response' in locals() and hasattr(response, 'text'):
+            print(f"Groq says: {response.text}")
+        return FALLBACK_RESPONSE
