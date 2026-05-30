@@ -2,9 +2,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
+from urllib.parse import urlparse
+import httpx
+import re
+
+from qr_shield_ai.nlp_engine import analyze_text_payload
 
 app = FastAPI()
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -13,7 +17,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 class InspectRequest(BaseModel):
     content: str
@@ -39,28 +42,130 @@ class TextAnalyzeResponse(BaseModel):
     nlp_confidence: float
     findings: List[str]
 
-
-
 @app.post("/api/inspect", response_model=InspectResponse)
 async def inspect_qr(request: InspectRequest):
+    url = request.content.strip()
+    
+    if not url.startswith("http"):
+        url = "http://" + url
+        
+    chain = []
+    threats = []
+    verdict = "SAFE"
+    score = 0
+    apk_detected_flag = False
+    
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=5.0) as client:
+            response = await client.get(url)
+            
+            for r in response.history:
+                chain.append(str(r.request.url))
+                
+            chain.append(str(response.url))
+            
+            content_header = str(response.headers.get("Content-Type", "")).lower()
+            if "application/vnd.android.package-archive" in content_header or str(response.url).endswith(".apk"):
+                apk_detected_flag = True
+                threats.append("Malicious APK download detected")
+                verdict = "DANGEROUS"
+                score += 80
+                
+    except Exception:
+        chain = [url]
+        threats.append("URL unreachable or timed out")
+        verdict = "SUSPICIOUS"
+        score = 50
+
+    if len(chain) > 2:
+        threats.append("Too many redirects")
+        verdict = "SUSPICIOUS"
+        score += 30
+    
+    tld_risk_flag = False
+    risky_tlds = [".xyz", ".top", ".pw", ".ru", ".zip", ".click"]
+    final_url = chain[-1]
+    domain = urlparse(final_url).netloc
+    
+    for tld in risky_tlds:
+        if domain.endswith(tld):
+            tld_risk_flag = True
+            threats.append("Risky domain extension detected")
+            if verdict != "DANGEROUS":
+                verdict = "SUSPICIOUS"
+            score += 40
+            break
+            
+    typosquat_match = None
+    brands = ["paypal", "amazon", "google", "apple", "microsoft", "netflix"]
+    
+    for brand in brands:
+        if brand in domain:
+            if domain != f"{brand}.com":
+                typosquat_match = brand
+                threats.append(f"Possible typosquatting targeting {brand}")
+                verdict = "DANGEROUS"
+                score += 50
+                break
+                
+    if score > 100:
+        score = 100
+        
     return InspectResponse(
-        verdict="SAFE",
-        threat_score=0,
+        verdict=verdict,
+        threat_score=score,
         content_type="URL",
-        redirect_chain=[request.content],
-        typosquat_match=None,
-        tld_risk=False,
-        apk_detected=False,
-        findings=[]
+        redirect_chain=chain,
+        typosquat_match=typosquat_match,
+        tld_risk=tld_risk_flag,
+        apk_detected=apk_detected_flag,
+        findings=threats
     )
 
 @app.post("/api/analyze-text", response_model=TextAnalyzeResponse)
 async def analyze_text(request: TextAnalyzeRequest):
+    text = request.text.lower()
+    threats = []
+    found_keywords = []
+    score = 0
+    verdict = "SAFE"
+    
+    phishing_keywords = [
+        "urgent", "suspend", "verify", "password", "wallet", 
+        "seed phrase", "login", "unauthorized", "kyc", "claim"
+    ]
+    
+    for word in phishing_keywords:
+        if re.search(r'\b' + word + r'\b', text):
+            found_keywords.append(word)
+            
+    if len(found_keywords) > 0:
+        threats.append(f"Found suspicious keywords: {', '.join(found_keywords)}")
+        score += len(found_keywords) * 20
+        
+    ai_result = analyze_text_payload(request.text)
+    nlp_label = ai_result["nlp_label"]
+    nlp_confidence = ai_result["nlp_confidence"]
+    
+    if ai_result["threat_score"] > 0:
+        score += ai_result["threat_score"]
+        for ai_finding in ai_result["findings"]:
+            if ai_finding not in threats:
+                threats.append(ai_finding)
+
+    if score >= 60:
+        verdict = "PHISHING"
+    elif score > 0:
+        verdict = "SUSPICIOUS"
+        
+    if score > 100:
+        score = 100
+        
     return TextAnalyzeResponse(
-        verdict="SAFE",
-        threat_score=0,
-        triggered_keywords=[],
-        nlp_label="safe",
-        nlp_confidence=0.99,
-        findings=[]
+        verdict=verdict,
+        threat_score=score,
+        triggered_keywords=found_keywords,
+        nlp_label=nlp_label,
+        nlp_confidence=nlp_confidence,
+        findings=threats
     )
